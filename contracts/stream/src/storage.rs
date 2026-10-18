@@ -389,3 +389,39 @@ pub fn get_streams_in_range(env: &Env, from_ts: u64, to_ts: u64) -> Vec<u64> {
     }
     result
 }
+
+/// Append `stream_id` to the token's stream index.
+///
+/// Called once per `create_stream` / `create_streams_batch`. O(1) amortised.
+pub fn index_token_stream(env: &Env, token: &Address, stream_id: u64) {
+    let key = DataKey::TokenStreams(token.clone());
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(stream_id);
+    env.storage().persistent().set(&key, &ids);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+/// Return all stream IDs funded with `token`.
+///
+/// Extends TTL on read (matching the `load_stream` pattern) so that the index
+/// does not expire for tokens with long-running streams.
+pub fn get_token_streams(env: &Env, token: &Address) -> Vec<u64> {
+    let key = DataKey::TokenStreams(token.clone());
+    let ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+    ids
+}

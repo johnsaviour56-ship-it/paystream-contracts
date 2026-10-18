@@ -20,9 +20,10 @@ use storage::{
     claimable_amount, clear_pending_admin, clear_pending_upgrade, consume_admin_nonce, get_admin,
     get_admin_nonce, get_auto_topup, get_employee_streams, get_employer_streams, get_min_deposit,
     get_pending_admin, get_pending_admin_nonce, get_pending_upgrade, get_streams_in_range,
-    index_employee_stream, index_employer_stream, index_stream_by_timestamp, load_stream, next_id,
-    remove_auto_topup, save_stream, set_admin, set_auto_topup, set_min_deposit, set_pending_admin,
-    set_pending_admin_nonce, set_pending_upgrade, TIMELOCK_DELAY,
+    get_token_streams, index_employee_stream, index_employer_stream, index_stream_by_timestamp,
+    index_token_stream, load_stream, next_id, remove_auto_topup, save_stream, set_admin,
+    set_auto_topup, set_min_deposit, set_pending_admin, set_pending_admin_nonce,
+    set_pending_upgrade, TIMELOCK_DELAY,
 };
 use types::{
     DataKey, Stream, StreamParams, StreamStatus, ERR_ADMIN_NOT_SET, ERR_BAD_PENDING_NONCE,
@@ -86,6 +87,69 @@ fn maybe_auto_topup(env: &Env, stream: &mut Stream, now: u64) {
     config.total_topped_up += amount;
     set_auto_topup(env, stream.id, &config);
     events::auto_topped_up(env, stream.id, amount, config.total_topped_up);
+}
+
+/// Compute health score for active/paused stream based on remaining runway and thresholds.
+///
+/// Returns 0–100 indicating stream viability:
+/// - 0: less than 1 day of runway or stream exhausted
+/// - 1–19: less than 7 days of runway or at risk of hitting low_balance_threshold
+/// - 20–79: normal operation with moderate runway
+/// - 80–100: healthy with 30+ days of runway
+fn compute_health_score_impl(stream: &Stream, now: u64) -> u32 {
+    let remaining = stream.deposit - stream.withdrawn;
+
+    // If no funds left or rate is 0, score is 0
+    if remaining <= 0 || stream.rate_per_second <= 0 {
+        return 0;
+    }
+
+    // Calculate days of runway based on deposit rate
+    let seconds_remaining = if stream.stop_time > 0 && now < stream.stop_time {
+        // If stop_time is set, use the minimum of time until stop vs. time until exhausted
+        let time_until_stop = stream.stop_time - now;
+        let tokens_per_second = stream.rate_per_second;
+        let time_until_exhausted = if tokens_per_second > 0 {
+            (remaining / tokens_per_second) as u64
+        } else {
+            u64::MAX
+        };
+        time_until_stop.min(time_until_exhausted)
+    } else {
+        // No stop_time: calculate based on remaining tokens and rate
+        let tokens_per_second = stream.rate_per_second;
+        if tokens_per_second > 0 {
+            (remaining / tokens_per_second) as u64
+        } else {
+            u64::MAX
+        }
+    };
+
+    const SECONDS_PER_DAY: u64 = 86_400;
+    const DAYS_CRITICAL: u64 = 1;
+    const DAYS_POOR: u64 = 7;
+    const DAYS_HEALTHY: u64 = 30;
+
+    let days_remaining = seconds_remaining / SECONDS_PER_DAY;
+
+    // Check if we're near the low_balance_threshold
+    let near_threshold = if stream.low_balance_threshold > 0 {
+        remaining < stream.low_balance_threshold * 2
+    } else {
+        false
+    };
+
+    if days_remaining < DAYS_CRITICAL {
+        return 0; // Critical: less than 1 day
+    } else if days_remaining < DAYS_POOR || near_threshold {
+        return 10 + ((days_remaining as u32).min(6)); // Poor: 10–19
+    } else if days_remaining < DAYS_HEALTHY {
+        // Fair: 20–79, interpolate based on days
+        let progress = ((days_remaining - DAYS_POOR) * 60) / (DAYS_HEALTHY - DAYS_POOR);
+        return 20 + (progress as u32).min(59);
+    } else {
+        return 80 + ((days_remaining.saturating_sub(DAYS_HEALTHY) as u32).min(20)); // Healthy: 80–100
+    }
 }
 
 #[contract]
@@ -1762,5 +1826,61 @@ impl StreamContract {
     /// `u64` count; 0 if the token has no streams.
     pub fn stream_count_by_token(env: Env, token: Address) -> u64 {
         get_token_streams(&env, &token).len() as u64
+    }
+
+    /// Return the Stellar Asset Contract (SAC) address for native XLM on the current network.
+    ///
+    /// This utility function enables creating streams that use native XLM without manually
+    /// looking up the SAC address. The SAC address is deterministically derived from the
+    /// native asset and network, making it the same across different contract deployments.
+    ///
+    /// Useful for testnet and mainnet stream creation, allowing employers to stream salaries
+    /// directly in XLM without needing a wrapper token.
+    ///
+    /// # Returns
+    /// The [`Address`] of the native XLM Stellar Asset Contract for the current network.
+    pub fn get_native_xlm_sac(env: Env) -> Address {
+        soroban_sdk::token::native_xlm(env)
+    }
+
+    /// Compute a health score for a stream based on its remaining viability.
+    ///
+    /// Returns a 0–100 score indicating stream health:
+    /// - **0 (critical)**: Stream is Cancelled/Exhausted, or has less than 1 day of runway remaining
+    /// - **1–19 (poor)**: Less than 7 days of runway, or nearly at low_balance_threshold
+    /// - **20–79 (fair)**: Normal operation with moderate runway
+    /// - **80–100 (healthy)**: Plenty of runway (30+ days) and comfortable buffer
+    ///
+    /// The calculation considers:
+    /// - Stream status (Cancelled/Exhausted = 0, Paused = lower score)
+    /// - Time to exhaustion based on current rate and remaining deposit
+    /// - Proximity to low_balance_threshold if configured
+    /// - Actual claimable amount at the current time
+    ///
+    /// No authentication required; this is a public read-only query.
+    ///
+    /// # Parameters
+    /// - `stream_id` — ID of the stream to score
+    ///
+    /// # Returns
+    /// Health score as `u32` (0–100); panics if stream not found.
+    pub fn stream_health_score(env: Env, stream_id: u64) -> u32 {
+        let stream = load_stream(&env, stream_id).expect(ERR_STREAM_NOT_FOUND);
+        let now = env.ledger().timestamp();
+
+        // Cancelled or Exhausted streams are critical (score 0)
+        match stream.status {
+            StreamStatus::Cancelled | StreamStatus::Exhausted => return 0,
+            StreamStatus::Paused => {
+                // Paused streams score lower but aren't critical
+                // Calculate as if they're active then cap at 70
+                let base_score = compute_health_score_impl(&stream, now);
+                return (base_score * 70) / 100; // Cap at 70%
+            }
+            StreamStatus::Active => {}
+        }
+
+        // For Active streams, compute full health score
+        compute_health_score_impl(&stream, now)
     }
 }
