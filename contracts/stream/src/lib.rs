@@ -21,7 +21,7 @@ use storage::{
     get_admin_nonce, get_auto_topup, get_employee_streams, get_employer_streams, get_min_deposit,
     get_pending_admin, get_pending_admin_nonce, get_pending_upgrade, get_streams_in_range,
     get_token_streams, index_employee_stream, index_employer_stream, index_stream_by_timestamp,
-    index_token_stream, load_stream, next_id, remove_auto_topup, save_stream, set_admin,
+    load_stream, next_id, remove_auto_topup, save_stream, set_admin,
     set_auto_topup, set_min_deposit, set_pending_admin, set_pending_admin_nonce,
     set_pending_upgrade, TIMELOCK_DELAY,
 };
